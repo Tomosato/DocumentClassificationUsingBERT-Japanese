@@ -114,7 +114,7 @@ class SeriesExample(Example):
 
 
 class DocumentClassifier:
-    def __init__(self, max_length=512, batch_size=32, num_labels=2, num_epochs=100, random_seed=None):
+    def __init__(self, net_dir=None, max_length=512, batch_size=32, num_labels=2, num_epochs=100, random_seed=None):
         self.max_length = max_length
         self.batch_size = batch_size
         self.num_labels = num_labels
@@ -122,7 +122,10 @@ class DocumentClassifier:
         if random_seed is not None:
             self.seed_everything(random_seed)
         self.tokenizer = BertJapaneseTokenizer.from_pretrained('bert-base-japanese-whole-word-masking')
-        self.net = BertForSequenceClassification.from_pretrained('bert-base-japanese-whole-word-masking', num_labels=num_labels)
+        if net_dir is None:
+            self.net = BertForSequenceClassification.from_pretrained('bert-base-japanese-whole-word-masking', num_labels=num_labels)
+        else:
+            self.net = BertForSequenceClassification.from_pretrained(net_dir)
         self.TEXT = torchtext.data.Field(
             sequential=True,
             tokenize=self.tokenizer_with_preprocessing,
@@ -145,6 +148,7 @@ class DocumentClassifier:
         torch.manual_seed(seed)
         torch.cuda.manual_seed(seed)
         torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
         logger.info('Set random seeds')
 
     def tokenizer_with_preprocessing(self, text):
@@ -160,13 +164,17 @@ class DocumentClassifier:
         ret = self.tokenizer.tokenize(text)
         return ret
 
+    def _build_vocab(self, ds, min_freq=1):
+        self.TEXT.build_vocab(ds, min_freq=min_freq)
+        self.TEXT.vocab.stoi = self.tokenizer.vocab
+        
     def fit(self, train_df, val_df, early_stopping_rounds=10, fine_tuning_type='fast'):
         logger.info('[Start]Create DataSets from DataFrames')
         train_ds = DataFrameDataset(train_df, fields={'Text': self.TEXT, 'Label': self.LABEL})
         val_ds = DataFrameDataset(val_df, fields={'Text': self.TEXT, 'Label': self.LABEL})
         logger.info('[Finished]Create DataSets from DataFrames')
-        self.TEXT.build_vocab(train_ds, min_freq=1)
-        self.TEXT.vocab.stoi = self.tokenizer.vocab
+        if not hasattr(self.TEXT, 'vocab'):
+            self._build_vocab(train_ds, min_freq=1)
         
         logger.info('[Start]Create DataLoaders')
         train_dl = torchtext.data.Iterator(train_ds, batch_size=self.batch_size, train=True)
@@ -187,20 +195,19 @@ class DocumentClassifier:
             # 3. 識別器を勾配計算ありに変更
             for name, param in self.net.classifier.named_parameters():
                 param.requires_grad = True
-            # 最適化手法の設定
-            # BERTの元の部分はファインチューニング
-            optimizer = optim.Adam([
-                {'params': self.net.bert.encoder.layer[-1].parameters(), 'lr': 5e-5},
-                {'params': self.net.classifier.parameters(), 'lr': 5e-5}
-            ], betas=(0.9, 0.999))
         elif fine_tuning_type == 'full':
             for name, param in self.net.named_parameters():
                 param.requires_grad = True
-            # optimの設定
-            optimizer = optim.Adam(self.net.parameters(), lr=5e-5, betas=(0.9, 0.999))
         else:
             logger.error('please input fine_tuning_type "fast" or "full"')
             raise ValueError
+
+        # 最適化手法の設定
+        # BERTの元の部分はファインチューニング
+        optimizer = optim.Adam([
+            {'params': self.net.bert.encoder.layer[-1].parameters(), 'lr': 5e-5},
+            {'params': self.net.classifier.parameters(), 'lr': 5e-5}
+        ], betas=(0.9, 0.999))
 
         # 損失関数の設定
         criterion = nn.CrossEntropyLoss()
@@ -304,6 +311,8 @@ class DocumentClassifier:
                 epoch_f1_score = f1_score(np.concatenate(np.array(ground_truths)), np.concatenate(np.array(predictions)), average=calc_f1_average)
                 logger.info('Epoch {}/{} | {:^5} |  Loss: {:.4f} Acc: {:.4f} F1-Score: {:4f}'.format(epoch+1, num_epochs,
                                                                             phase, epoch_loss, epoch_acc, epoch_f1_score))
+                #if phase == 'val':
+                #    torch.save(net.state_dict(), f'../data/model/bert_ckpt/bert_gluon_epoch_{epoch}.model')
                 if phase == 'val':
                     early_stopping(epoch_loss, net)
         
@@ -314,12 +323,15 @@ class DocumentClassifier:
                     return net
         
                 t_epoch_start = time.time()
-
+        
+        torch.cuda.empty_cache()
         return net
     
     def predict(self, test_df):
         logger.info('[Start]Create DataSet, DataLoader from DataFrame')
         test_ds = DataFrameDataset(test_df, fields={'Text': self.TEXT})
+        if not hasattr(self.TEXT, 'vocab'):
+            self._build_vocab(test_ds, min_freq=1)
         test_dl = torchtext.data.Iterator(test_ds, batch_size=self.batch_size, train=False, sort=False)
         logger.info('[Finished]Create DataSet, DataLoader from DataFrame')
         # GPUが使えるかを確認
